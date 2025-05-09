@@ -3,6 +3,7 @@ const multer = require('multer');
 const puppeteer = require('puppeteer');
 const path = require('path');
 const fs = require('fs').promises;
+const os = require('os');
 const { parseSVG } = require('./utils/svgParser');
 
 const app = express();
@@ -15,11 +16,17 @@ const upload = multer({
 // Browser pool configuration
 const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY) || 2;
 const BROWSER_TIMEOUT = 2 * 60 * 1000; // 2 minutes in milliseconds
+const RENDER_TIMEOUT = parseInt(process.env.RENDER_TIMEOUT) || 10 * 1000; // Configurable timeout in milliseconds
+
+// Server configuration
+const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
+const SERVER_PORT = parseInt(process.env.SERVER_PORT) || 3000;
 
 // Browser pool state
 const browserPool = {
   browsers: [], // Array of { browser, lastUsed, inUse }
   cleanupInterval: null,
+  browsersBeingLaunched: 0, // Track number of browsers currently being launched
 
   async initialize() {
     // Start cleanup interval
@@ -47,40 +54,80 @@ const browserPool = {
       return availableBrowser.browser;
     }
 
-    // If we haven't reached the limit, create a new browser
-    if (this.browsers.length < MAX_CONCURRENCY) {
-      console.log('Launching new browser');
-      const browser = await puppeteer.launch({
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    // Check if we've reached the limit before launching a new browser
+    if (this.browsers.length + this.browsersBeingLaunched >= MAX_CONCURRENCY) {
+      // Wait for a browser to become available
+      console.log('Waiting for available browser...');
+      return new Promise((resolve) => {
+        const checkInterval = setInterval(() => {
+          const availableBrowser = this.browsers.find(b => !b.inUse);
+          if (availableBrowser) {
+            clearInterval(checkInterval);
+            availableBrowser.inUse = true;
+            availableBrowser.lastUsed = Date.now();
+            resolve(availableBrowser.browser);
+          }
+        }, 100);
       });
+    }
+
+    // If we haven't reached the limit, create a new browser
+    console.log('Launching new browser');
+    this.browsersBeingLaunched++;
+    try {
+      const browser = await puppeteer.launch({
+        args: ['--no-sandbox',
+          '--disable-setuid-sandbox']
+      });
+
       this.browsers.push({
         browser,
         lastUsed: Date.now(),
         inUse: true
       });
       return browser;
+    } finally {
+      this.browsersBeingLaunched--;
     }
-
-    // Wait for a browser to become available
-    console.log('Waiting for available browser...');
-    return new Promise((resolve) => {
-      const checkInterval = setInterval(() => {
-        const availableBrowser = this.browsers.find(b => !b.inUse);
-        if (availableBrowser) {
-          clearInterval(checkInterval);
-          availableBrowser.inUse = true;
-          availableBrowser.lastUsed = Date.now();
-          resolve(availableBrowser.browser);
-        }
-      }, 100);
-    });
   },
 
   releaseBrowser(browser) {
     const browserEntry = this.browsers.find(b => b.browser === browser);
     if (browserEntry) {
+      console.log("Releasing browser");
       browserEntry.inUse = false;
       browserEntry.lastUsed = Date.now();
+    }
+  },
+
+  async killBrowser(browser) {
+    if (!browser) {
+      console.log('No browser instance to kill');
+      return;
+    }
+
+    try {
+      // Get the browser process
+      const process = browser.process();
+      if (process) {
+        // Kill the process and all its children
+        process.kill('SIGKILL');
+      } else {
+        console.log('Browser process not found, browser might be already closed');
+      }
+
+      // Remove the browser from the pool
+      const browserIndex = this.browsers.findIndex(b => b.browser === browser);
+      if (browserIndex !== -1) {
+        this.browsers.splice(browserIndex, 1);
+      }
+    } catch (error) {
+      console.error('Error killing browser process:', error);
+      // Still try to remove the browser from the pool even if killing fails
+      const browserIndex = this.browsers.findIndex(b => b.browser === browser);
+      if (browserIndex !== -1) {
+        this.browsers.splice(browserIndex, 1);
+      }
     }
   },
 
@@ -247,6 +294,7 @@ app.get('/', (req, res) => {
 // SVG to PNG conversion endpoint
 app.post('/', upload.single('svg'), async (req, res) => {
   let browser;
+  let tempHtmlPath;
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No SVG file provided' });
@@ -300,6 +348,7 @@ app.post('/', upload.single('svg'), async (req, res) => {
                         width: 100%;
                         height: 100%;
                         overflow: hidden;
+                        background: transparent;
                     }
                     img {
                         width: 100%;
@@ -314,7 +363,8 @@ app.post('/', upload.single('svg'), async (req, res) => {
             </html>
         `;
 
-    const tempHtmlPath = path.join(__dirname, 'temp.html');
+    // Create temporary file with unique name
+    tempHtmlPath = path.join(os.tmpdir(), `svg-convert-${Date.now()}-${Math.random().toString(36).substring(2)}.html`);
     await fs.writeFile(tempHtmlPath, htmlContent);
 
     // Get a browser from the pool
@@ -327,20 +377,53 @@ app.post('/', upload.single('svg'), async (req, res) => {
       deviceScaleFactor: 1
     });
 
-    await page.goto(`file://${tempHtmlPath}`);
+    // Set up timeout for page.goto()
+    let timeoutId;
+    let timeoutResolve;
+    const timeoutPromise = new Promise((resolve, reject) => {
+      timeoutResolve = resolve;
+      timeoutId = setTimeout(async () => {
+        // Kill the browser process immediately
+        await browserPool.killBrowser(browser);
+        reject(new Error('SVG rendering timed out after 10 seconds'));
+      }, RENDER_TIMEOUT);
+    });
+
+    try {
+      await Promise.race([
+        page.goto(`file://${tempHtmlPath}`),
+        timeoutPromise
+      ]);
+
+      // Clear the timeout and resolve the promise since the conversion succeeded
+      clearTimeout(timeoutId);
+      timeoutResolve();
+    } catch (error) {
+      // Kill the browser and remove it from the pool
+      await browserPool.killBrowser(browser);
+      browser = null;
+
+      if (error.message.includes('timed out')) {
+        return res.status(504).json({
+          error: 'SVG rendering timed out',
+          details: 'The SVG file took too long to render. This might be due to complex animations or infinite loops in the SVG.'
+        });
+      }
+      throw error;
+    }
 
     // Determine content type from Accept header
     const acceptHeader = req.headers.accept || 'image/png';
     let screenshotOptions = {
       type: acceptHeader.includes('webp') ? 'webp' :
-        acceptHeader.includes('jpeg') ? 'jpeg' : 'png'
+        acceptHeader.includes('jpeg') ? 'jpeg' : 'png',
+      omitBackground: true  // This ensures transparency is preserved
     };
 
     const screenshot = await page.screenshot(screenshotOptions);
 
     // Cleanup
     await page.close();
-    await fs.unlink(tempHtmlPath);
 
     // Release the browser back to the pool
     browserPool.releaseBrowser(browser);
@@ -356,12 +439,20 @@ app.post('/', upload.single('svg'), async (req, res) => {
       browserPool.releaseBrowser(browser);
     }
     res.status(500).json({ error: 'Internal server error', details: error.message });
+  } finally {
+    // Clean up temporary file in all cases
+    if (tempHtmlPath) {
+      try {
+        await fs.unlink(tempHtmlPath);
+      } catch (error) {
+        console.error('Error cleaning up temporary file:', error);
+      }
+    }
   }
 });
 
-const PORT = process.env.SERVER_PORT || 3000;
-const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+const server = app.listen(SERVER_PORT, SERVER_HOST, () => {
+  console.log(`Server running on ${SERVER_HOST}:${SERVER_PORT}`);
   console.log(`Browser pool size: ${MAX_CONCURRENCY}`);
 });
 
