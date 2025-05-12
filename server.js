@@ -367,8 +367,26 @@ app.post('/', upload.single('svg'), async (req, res) => {
     tempHtmlPath = path.join(os.tmpdir(), `svg-convert-${Date.now()}-${Math.random().toString(36).substring(2)}.html`);
     await fs.writeFile(tempHtmlPath, htmlContent);
 
-    // Get a browser from the pool
+    // Set up abort handler
+    const abortHandler = () => {
+      console.log('Request aborted by client');
+      if (browser) {
+        browserPool.releaseBrowser(browser);
+        browser = null;
+      }
+    };
+    req.on('close', abortHandler);
+
+    // Get a browser from the pool. This can take the most time, so
+    // afterwards, we check if the client disconnected before continuing.
     browser = await browserPool.getBrowser();
+
+    req.removeListener('close', abortHandler);  // Remove the abort handler
+    if (browser == null) {
+      // client aborted the connection.
+      return res.status(499).json({ error: 'Client aborted the connection' });
+    }
+
     const page = await browser.newPage();
 
     await page.setViewport({
@@ -435,6 +453,18 @@ app.post('/', upload.single('svg'), async (req, res) => {
 
   } catch (error) {
     console.error('Error processing request:', error);
+
+    // Handle screenshot timeout specifically
+    if (error.message.includes('Page.captureScreenshot timed out')) {
+      console.log('Screenshot timeout detected, killing browser');
+      await browserPool.killBrowser(browser);
+      browser = null;
+      return res.status(500).json({
+        error: 'Screenshot timeout',
+        details: 'The browser took too long to capture the screenshot. This might be due to a complex SVG or system resource constraints.'
+      });
+    }
+
     if (browser) {
       browserPool.releaseBrowser(browser);
     }
